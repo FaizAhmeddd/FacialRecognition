@@ -56,6 +56,28 @@ def is_recently_processed(visitor_id: str) -> bool:
             del recent_visitors[visitor_id]
     return False
 
+# Utility function to serialize MongoDB documents
+def serialize_mongo_document(document):
+    if isinstance(document, dict):
+        return {k: str(v) if isinstance(v, ObjectId) else v for k, v in document.items()}
+    return document
+
+@app.get("/unknown-visitors/")
+async def get_unknown_visitors():
+    try:
+        # Retrieve all records from the unknown_visitors collection
+        unknown_visitors = await asyncio.to_thread(list, unknown_visitor_data.find())
+        
+        # Serialize the documents to make them JSON serializable
+        serialized_visitors = [serialize_mongo_document(visitor) for visitor in unknown_visitors]
+        
+        # Return the serialized data as JSON response
+        return JSONResponse(content={"unknown_visitors": serialized_visitors})
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve unknown visitors: {str(e)}")
+
+
 def update_recent_visitor(visitor_id: str):
     recent_visitors[visitor_id] = time.time()
 
