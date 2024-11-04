@@ -96,45 +96,11 @@ async def get_unknown_visitors():
 def update_recent_visitor(visitor_id: str):
     recent_visitors[visitor_id] = time.time()
 
-# ---------------------------- Monitor with webcam ---------------------------------
-
-# Capture webcam stream
-async def capture_webcam_stream(webcam_index: int, community_id: str, camera_id: str):
-    recognized_ids, unknown_visitors = await FaceRecognitionWebcam(webcam_index, community_id, camera_id)
-    
-    for visitor_id in recognized_ids:
-        # Check if this visitor has been recently processed
-        if is_recently_processed(visitor_id):
-            logger.info(f"Visitor {visitor_id} already processed recently. Skipping notification.")
-            continue  # Skip sending the webhook if already processed
-
-# Start webcam monitoring
-async def start_webcam_monitoring(webcam_index: int, community_id: str, camera_id: str):
-    await capture_webcam_stream(webcam_index, community_id, camera_id)
-
-@app.post("/monitor-webcam/")
-async def monitor_webcam(
-    community_id: str = Form(...),
-    camera_id: str = Form(...),
-    webcam_index: int = Form(0),
-):
-    try:
-        # Directly call the function instead of using background tasks
-        await start_webcam_monitoring(webcam_index, community_id, camera_id)
-        return JSONResponse({"message": "Webcam monitoring completed successfully"})
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to monitor webcam: {str(e)}")
-
-
-
-
-
-
 
 # --------------------------- RTSP Monitoring ------------------------------
 
-# Simulate RTSP monitoring logic
 def monitor_rtsp_stream(rtsp_url: str, community_id: str, camera_id: str):
+    """Function that will run in a separate process to monitor a specific RTSP stream."""
     logger.info(f"Started RTSP monitoring for {rtsp_url} (Community: {community_id}, Camera: {camera_id})")
     
     try:
@@ -143,8 +109,6 @@ def monitor_rtsp_stream(rtsp_url: str, community_id: str, camera_id: str):
             frame, recognized_ids, recognized_visitors, unknown_visitors = asyncio.run(
                 FaceRecognitionRtsp(rtsp_url, community_id, camera_id)
             )
-            
-            # Process the frame, recognized_ids, etc.
             logger.info(f"Processed stream {rtsp_url} - recognized IDs: {recognized_ids}")
             time.sleep(5)  # Simulate processing delay
     except Exception as e:
@@ -152,6 +116,7 @@ def monitor_rtsp_stream(rtsp_url: str, community_id: str, camera_id: str):
 
 # Helper function to start RTSP monitoring in a new process
 def start_rtsp_monitoring_process(rtsp_urls: List[str], community_id: str, camera_id: str):
+    """This function will create separate processes for each RTSP URL."""
     for rtsp_url in rtsp_urls:
         process_key = f"{community_id}_{camera_id}_{rtsp_url}"
         if process_key in process_registry:
@@ -171,8 +136,9 @@ async def monitor_multiple_rtsp(
     community_id: str = Form(...),
     camera_id: str = Form(...),
 ):
+    """Start separate processes to monitor multiple RTSP streams concurrently."""
     try:
-        # Start new background process for monitoring
+        # Start new background processes for each RTSP URL
         start_rtsp_monitoring_process(rtsp_urls, community_id, camera_id)
         return JSONResponse({
             "message": "RTSP monitoring started successfully",
@@ -186,6 +152,7 @@ async def monitor_multiple_rtsp(
 # --------------------------- Webcam Monitoring ------------------------------
 
 def monitor_webcam_process(webcam_index: int, community_id: str, camera_id: str):
+    """Run webcam monitoring in a separate process."""
     try:
         recognized_ids, unknown_visitors = asyncio.run(FaceRecognitionWebcam(webcam_index, community_id, camera_id))
         for visitor_id in recognized_ids:
@@ -199,6 +166,7 @@ async def monitor_webcam(
     camera_id: str = Form(...),
     webcam_index: int = Form(0),
 ):
+    """Start webcam monitoring in a background process."""
     try:
         process = multiprocessing.Process(target=monitor_webcam_process, args=(webcam_index, community_id, camera_id))
         process.start()
@@ -211,7 +179,13 @@ async def monitor_webcam(
 # --------------------------- Register Visitor with Image ------------------------------
 
 def register_visitor_with_image(community_id, resident_id, visitor_id, visitor_name, plate_no, image_bytes):
+    """Process the visitor registration with the uploaded image in a separate process, ensuring unique visitor_id."""
     try:
+        # Check if the visitor_id already exists in the registered_faces collection
+        if visitor_data.find_one({"visitor_id": visitor_id}):
+            logger.error(f"Visitor ID {visitor_id} already exists in the registered_faces collection.")
+            return {"error": f"Visitor ID {visitor_id} already exists."}
+
         # Generate face embeddings using the uploaded image
         image_copies = [UploadFile(filename=f"copy_{i}.jpg", file=io.BytesIO(image_bytes)) for i in range(5)]
         embeddings = asyncio.run(get_dlib_embeddings(image_copies))
@@ -240,6 +214,8 @@ def register_visitor_with_image(community_id, resident_id, visitor_id, visitor_n
         logger.error(f"Failed to register visitor: {str(e)}")
         return {"error": f"Failed to register visitor: {str(e)}"}
 
+
+
 @app.post("/visitors/register-with-single-image/")
 async def register_visitor_with_single_image(
     community_id: str = Form(...),
@@ -249,6 +225,7 @@ async def register_visitor_with_single_image(
     plate_no: str = Form(None),
     image: UploadFile = File(...),
 ):
+    """Start visitor registration process in a background process, ensuring unique visitor_id."""
     try:
         # Read the uploaded image once
         image_bytes = await image.read()
@@ -265,18 +242,27 @@ async def register_visitor_with_single_image(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to start visitor registration process: {str(e)}")
 
+
 # --------------------------- Update Unknown Visitor to Registered ------------------------------
 
 def update_unknown_to_registered(unknown_visitor_id, new_visitor_id, community_id, resident_id, visitor_name, plate_no):
+    """Update an unknown visitor to registered in a background process and remove the record from the unknown collection. Ensures visitor_id uniqueness."""
     try:
+        # Check if the new_visitor_id already exists in the registered_faces collection
+        if visitor_data.find_one({"visitor_id": new_visitor_id}):
+            logger.error(f"Visitor ID {new_visitor_id} already exists in the registered_faces collection.")
+            return {"error": f"Visitor ID {new_visitor_id} already exists."}
+
+        # Find the visitor in the unknown_faces collection
         unknown_visitor = unknown_visitor_data.find_one({"visitor_id": unknown_visitor_id})
         if not unknown_visitor:
-            logger.error("Unknown visitor not found.")
+            logger.error(f"Unknown visitor with ID {unknown_visitor_id} not found.")
             return {"error": "Unknown visitor not found."}
 
-        # Update the embeddings and insert as a registered visitor
+        # Update the embeddings and prepare the document for registered_faces
         old_embeddings = unknown_visitor["embeddings"]
         updated_embeddings = f"{new_visitor_id},{','.join(old_embeddings.split(',')[1:])}"
+
         registered_visitor = {
             "community_id": community_id,
             "resident_id": resident_id,
@@ -284,18 +270,27 @@ def update_unknown_to_registered(unknown_visitor_id, new_visitor_id, community_i
             "visitor_name": visitor_name,
             "plate_no": plate_no,
             "embeddings": updated_embeddings,
-            "face_image": unknown_visitor["face_image"],
+            "face_image": unknown_visitor["face_image"],  # Keep the face image from the unknown record
         }
 
+        # Insert the updated visitor into the registered_faces collection
         result = visitor_data.insert_one(registered_visitor)
+
         if result.inserted_id:
-            unknown_visitor_data.delete_one({"visitor_id": unknown_visitor_id})
-        logger.info(f"Unknown visitor {unknown_visitor_id} updated to registered visitor {new_visitor_id}")
+            # After a successful insertion, delete the visitor from unknown_faces collection
+            delete_result = unknown_visitor_data.delete_one({"visitor_id": unknown_visitor_id})
+            if delete_result.deleted_count == 1:
+                logger.info(f"Unknown visitor {unknown_visitor_id} successfully updated to registered visitor {new_visitor_id} and removed from unknown_faces collection.")
+            else:
+                logger.error(f"Failed to remove unknown visitor {unknown_visitor_id} from the unknown_faces collection.")
+            
         return {"status": "success", "visitor_id": new_visitor_id}
 
     except Exception as e:
-        logger.error(f"Failed to update visitor: {str(e)}")
+        logger.error(f"Failed to update unknown visitor {unknown_visitor_id}: {str(e)}")
         return {"error": f"Failed to update visitor: {str(e)}"}
+
+
 
 @app.put("/unknown-visitors/register/")
 async def update_unknown_visitor_to_registered(
@@ -306,6 +301,7 @@ async def update_unknown_visitor_to_registered(
     visitor_name: str = Form(...),
     plate_no: Optional[str] = Form(None),
 ):
+    """Start the process to update unknown visitor to registered in a background process."""
     try:
         # Start the update process in a new background process
         process = multiprocessing.Process(
@@ -319,10 +315,13 @@ async def update_unknown_visitor_to_registered(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to start update process: {str(e)}")
 
+
 # --------------------------- Shutdown Logic ------------------------------
 
-def signal_handler(signal_received, frame):
-    logger.info(f"Signal {signal_received} received. Initiating shutdown.")
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Gracefully terminate all running processes on shutdown."""
+    logger.info("Shutting down application...")
 
     # Terminate all running processes
     for key, process in process_registry.items():
@@ -330,16 +329,8 @@ def signal_handler(signal_received, frame):
         process.terminate()
         process.join()
 
-    uvicorn_server.should_exit = True
-
-# Register signal handlers for graceful shutdown
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
-
 # --------------------------- Main Entry Point ------------------------------
 
 if __name__ == "__main__":
-    uvicorn_server = uvicorn.Server(
-        uvicorn.Config("mainv4:app", host="0.0.0.0", port=8000)
-    )
-    uvicorn_server.run()
+    # Use `uvicorn` to run the FastAPI app
+    uvicorn.run("mainv4:app", host="0.0.0.0", port=8000)
