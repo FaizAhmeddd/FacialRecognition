@@ -324,10 +324,29 @@ async def shutdown_event():
     logger.info("Shutting down application...")
 
     # Terminate all running processes
-    for key, process in process_registry.items():
-        logger.info(f"Terminating process {key} (PID: {process.pid})")
-        process.terminate()
-        process.join()
+    for key, process in list(process_registry.items()):
+        if process.is_alive():
+            logger.info(f"Terminating process {key} (PID: {process.pid})")
+            try:
+                # Attempt to terminate the process gracefully
+                process.terminate()
+                process.join(timeout=2)  # Give the process some time to terminate
+            except Exception as e:
+                logger.error(f"Error terminating process {key} (PID: {process.pid}): {str(e)}")
+
+            # If the process is still alive after termination, force kill it
+            if process.is_alive():
+                logger.info(f"Force killing process {key} (PID: {process.pid})")
+                try:
+                    process.kill()  # Force kill if it didn't terminate
+                    process.join()  # Ensure the process is fully terminated
+                except Exception as e:
+                    logger.error(f"Error killing process {key} (PID: {process.pid}): {str(e)}")
+
+        # Remove the process from the registry once handled
+        process_registry.pop(key, None)
+
+    logger.info("All processes terminated. Application shutdown complete.")
 
 # --------------------------- Main Entry Point ------------------------------
 
