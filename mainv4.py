@@ -56,12 +56,6 @@ def is_recently_processed(visitor_id: str) -> bool:
             del recent_visitors[visitor_id]
     return False
 
-# Utility function to serialize MongoDB documents
-def serialize_mongo_document(document):
-    if isinstance(document, dict):
-        return {k: str(v) if isinstance(v, ObjectId) else v for k, v in document.items()}
-    return document
-
 @app.get("/unknown-visitors/")
 async def get_unknown_visitors():
     try:
@@ -117,9 +111,11 @@ async def capture_rtsp_stream(rtsp_url: str, community_id: str, camera_id: str):
 # Start RTSP monitoring (runs indefinitely in the background)
 async def start_rtsp_monitoring(rtsp_urls: List[str], community_id: str, camera_id: str):
     while True:
+        # Capture frames concurrently from all RTSP URLs
         tasks = [capture_rtsp_stream(url, community_id, camera_id) for url in rtsp_urls]
         await asyncio.gather(*tasks)  # Run all capture tasks concurrently
-        await asyncio.sleep(1)  # Add delay between monitoring cycles to avoid overwhelming resources
+        
+        await asyncio.sleep(1)  # Add delay between monitoring cycles to yield control
 
 @app.post("/monitor-multiple-rtsp/")
 async def monitor_multiple_rtsp(
