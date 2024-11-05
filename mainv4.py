@@ -1,355 +1,495 @@
-from fastapi import FastAPI, HTTPException, Form, UploadFile, File
-from fastapi.responses import JSONResponse
-from pymongo import MongoClient
-from pydantic import BaseModel
+import pandas as pd
+import numpy as np
+import cv2
 import dlib
-import base64
+from ultralytics import YOLO
+from pymongo import MongoClient
 import asyncio
-import io
+import uuid
+import base64
+import os
+import torch
+import csv
 import time
-from bson import ObjectId
-from typing import Optional, List, Dict
-from functions import get_dlib_embeddings
-from recognition_with_webcam import FaceRecognitionWebcam
-from main_with_rtsp_recognition import FaceRecognitionRtsp
-import logging
-from datetime import datetime
-from typing import Dict
-import signal
-import uvicorn
-import multiprocessing
+from pymongo.errors import PyMongoError
+import json
+import requests  
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
 
-# --------------------------- MongoDB & detector ------------------------------
 
-# Initialize FastAPI
-app = FastAPI()
 
-# MongoDB Configuration
+
+import numpy as np
+
+# MongoDB configuration
 MONGO_URI = "mongodb://82.112.231.98:27017/"
-client = MongoClient(MONGO_URI)
+client = MongoClient(
+    MONGO_URI,
+    serverSelectionTimeoutMS=50000,
+    socketTimeoutMS=50000,
+    connectTimeoutMS=50000,
+    maxPoolSize=100
+)
 db = client["face_database"]
-visitor_data = db["registered_faces"]
-unknown_visitor_data = db["unknown_faces"]
+registered_data = db["registered_faces"]
+unknown_data = db["unknown_faces"]
+# Global variable to track the last save time for unknown visitors
+last_unknown_save_time = 0
 
-# Initialize face detector
+# Model and device setup
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+face_rec_model = dlib.face_recognition_model_v1("dlib_face_recognition_resnet_model_v1.dat")
+shape_predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
+yolo_detector = YOLO('yolov8n-face.pt')
+# Initialize Dlib's face detector
 detector = dlib.get_frontal_face_detector()
+# Initialize dlib's face predictor and recognition model
+predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
+face_reco_model = dlib.face_recognition_model_v1(
+    "dlib_face_recognition_resnet_model_v1.dat")
 
-# In-memory cache
-recent_visitors = {}
-CACHE_EXPIRY_SECONDS = 600
+# Path to CSV file
+csv_file = "visitor_embeddings.csv"
 
-# Setup logging configuration
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Global dictionary to store unknown face data with timestamps and embedding history
+unknown_face_cache = {
+    'last_saves': {},  # Stores last save time for each face
+    'embedding_history': {},  # Stores historical embeddings for comparison
+}
 
-# Global dictionary to keep track of running processes
-process_registry: Dict[str, multiprocessing.Process] = {}
-# Initialize face detector
+# --------------------------- Helper Functions ---------------------------
+def calculate_embedding_similarity(embedding1, embedding2):
+    """Calculate cosine similarity between two embeddings."""
+    return np.dot(embedding1, embedding2) / (np.linalg.norm(embedding1) * np.linalg.norm(embedding2))
 
-
-
-# ---------------------------------- get unknown visitor records ------------------------------
-
-
-
-
-def strip_extra_quotes(value: str) -> str:
-    if value:
-        return value.strip('"')
-    return value
-
-def serialize_mongo_document(document):
-    if isinstance(document, dict):
-        return {k: serialize_mongo_document(v) for k, v in document.items()}
-    elif isinstance(document, list):
-        return [serialize_mongo_document(item) for item in document]
-    elif isinstance(document, ObjectId):
-        return str(document)
-    else:
-        return document
-
-def is_recently_processed(visitor_id: str) -> bool:
-    current_time = time.time()
-    if visitor_id in recent_visitors:
-        last_seen = recent_visitors[visitor_id]
-        if current_time - last_seen < CACHE_EXPIRY_SECONDS:
+def is_similar_face(new_embedding, stored_embeddings, similarity_threshold=0.95):
+    """Check if a new embedding is similar to any stored embeddings."""
+    for stored_embedding in stored_embeddings:
+        if calculate_embedding_similarity(new_embedding, stored_embedding) > similarity_threshold:
             return True
-        else:
-            del recent_visitors[visitor_id]
     return False
 
-@app.get("/unknown-visitors/")
-async def get_unknown_visitors():
+def parse_embeddings(embeddings_str: str) -> tuple:
+    """Parse string of embeddings into ID and embedding list format."""
     try:
-        # Retrieve all records from the unknown_visitors collection
-        unknown_visitors = await asyncio.to_thread(list, unknown_visitor_data.find())
-        
-        # Serialize the documents to make them JSON serializable
-        serialized_visitors = [serialize_mongo_document(visitor) for visitor in unknown_visitors]
-        
-        # Return the serialized data as JSON response
-        return JSONResponse(content={"unknown_visitors": serialized_visitors})
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve unknown visitors: {str(e)}")
-
-def update_recent_visitor(visitor_id: str):
-    recent_visitors[visitor_id] = time.time()
-
-
-# --------------------------- RTSP Monitoring ------------------------------
-
-def monitor_rtsp_stream(rtsp_url: str, community_id: str, camera_id: str):
-    """Function that will run in a separate process to monitor a specific RTSP stream."""
-    logger.info(f"Started RTSP monitoring for {rtsp_url} (Community: {community_id}, Camera: {camera_id})")
-    
-    try:
-        while True:
-            # Call the async FaceRecognitionRtsp function using asyncio.run
-            frame, recognized_ids, recognized_visitors, unknown_visitors = asyncio.run(
-                FaceRecognitionRtsp(rtsp_url, community_id, camera_id)
-            )
-            logger.info(f"Processed stream {rtsp_url} - recognized IDs: {recognized_ids}")
-            time.sleep(5)  # Simulate processing delay
-    except Exception as e:
-        logger.error(f"Error in monitoring RTSP stream {rtsp_url}: {str(e)}")
-
-# Helper function to start RTSP monitoring in a new process
-def start_rtsp_monitoring_process(rtsp_urls: List[str], community_id: str, camera_id: str):
-    """This function will create separate processes for each RTSP URL."""
-    for rtsp_url in rtsp_urls:
-        process_key = f"{community_id}_{camera_id}_{rtsp_url}"
-        if process_key in process_registry:
-            logger.info(f"RTSP monitoring for {rtsp_url} already running. Skipping.")
-            continue
-
-        # Create a new process for each RTSP URL
-        process = multiprocessing.Process(target=monitor_rtsp_stream, args=(rtsp_url, community_id, camera_id))
-        process.start()
-        process_registry[process_key] = process
-
-        logger.info(f"Started new process for RTSP monitoring: {rtsp_url} (PID: {process.pid})")
-
-@app.post("/monitor-multiple-rtsp/")
-async def monitor_multiple_rtsp(
-    rtsp_urls: List[str] = Form(...),
-    community_id: str = Form(...),
-    camera_id: str = Form(...),
-):
-    """Start separate processes to monitor multiple RTSP streams concurrently."""
-    try:
-        # Start new background processes for each RTSP URL
-        start_rtsp_monitoring_process(rtsp_urls, community_id, camera_id)
-        return JSONResponse({
-            "message": "RTSP monitoring started successfully",
-            "community_id": community_id,
-            "camera_id": camera_id,
-            "rtsp_urls": rtsp_urls
-        })
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to start RTSP monitoring: {str(e)}")
-
-# --------------------------- Webcam Monitoring ------------------------------
-
-def monitor_webcam_process(webcam_index: int, community_id: str, camera_id: str):
-    """Run webcam monitoring in a separate process."""
-    try:
-        recognized_ids, unknown_visitors = asyncio.run(FaceRecognitionWebcam(webcam_index, community_id, camera_id))
-        for visitor_id in recognized_ids:
-            logger.info(f"Visitor {visitor_id} recognized.")
-    except Exception as e:
-        logger.error(f"Failed to monitor webcam: {str(e)}")
-
-@app.post("/monitor-webcam/")
-async def monitor_webcam(
-    community_id: str = Form(...),
-    camera_id: str = Form(...),
-    webcam_index: int = Form(0),
-):
-    """Start webcam monitoring in a background process."""
-    try:
-        process = multiprocessing.Process(target=monitor_webcam_process, args=(webcam_index, community_id, camera_id))
-        process.start()
-        process_registry[f"webcam_{community_id}_{camera_id}"] = process
-
-        return JSONResponse({"message": "Webcam monitoring started successfully"})
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to start webcam monitoring: {str(e)}")
-
-# --------------------------- Register Visitor with Image ------------------------------
-
-def register_visitor_with_image(community_id, resident_id, visitor_id, visitor_name, plate_no, image_bytes):
-    """Process the visitor registration with the uploaded image in a separate process, ensuring unique visitor_id."""
-    try:
-        # Check if the visitor_id already exists in the registered_faces collection
-        if visitor_data.find_one({"visitor_id": visitor_id}):
-            logger.error(f"Visitor ID {visitor_id} already exists in the registered_faces collection.")
-            return {"error": f"Visitor ID {visitor_id} already exists."}
-
-        # Generate face embeddings using the uploaded image
-        image_copies = [UploadFile(filename=f"copy_{i}.jpg", file=io.BytesIO(image_bytes)) for i in range(5)]
-        embeddings = asyncio.run(get_dlib_embeddings(image_copies))
-
-        if not embeddings:
-            logger.error("No valid face embeddings could be generated.")
-            return {"error": "No valid face embeddings could be generated."}
-
-        # Prepare the document to insert into MongoDB
-        embeddings_with_id = f"{visitor_id},{embeddings}"
-        visitor = {
-            "community_id": community_id,
-            "resident_id": resident_id,
-            "visitor_id": visitor_id,
-            "visitor_name": visitor_name,
-            "plate_no": plate_no,
-            "embeddings": embeddings_with_id,
-        }
-
-        # Insert the new visitor record into the database
-        result = visitor_data.insert_one(visitor)
-        logger.info(f"Visitor {visitor_id} registered successfully with ID {result.inserted_id}")
-        return {"status": "success", "visitor_id": visitor_id}
-
-    except Exception as e:
-        logger.error(f"Failed to register visitor: {str(e)}")
-        return {"error": f"Failed to register visitor: {str(e)}"}
-
-
-
-@app.post("/visitors/register-with-single-image/")
-async def register_visitor_with_single_image(
-    community_id: str = Form(...),
-    resident_id: str = Form(...),
-    visitor_id: str = Form(...),
-    visitor_name: str = Form(...),
-    plate_no: str = Form(None),
-    image: UploadFile = File(...),
-):
-    """Start visitor registration process in a background process, ensuring unique visitor_id."""
-    try:
-        # Read the uploaded image once
-        image_bytes = await image.read()
-
-        # Start the registration process in a new background process
-        process = multiprocessing.Process(
-            target=register_visitor_with_image,
-            args=(community_id, resident_id, visitor_id, visitor_name, plate_no, image_bytes)
-        )
-        process.start()
-        process_registry[f"register_{visitor_id}"] = process
-
-        return JSONResponse({"message": f"Visitor registration process started for {visitor_id}"})
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to start visitor registration process: {str(e)}")
-
-
-# --------------------------- Update Unknown Visitor to Registered ------------------------------
-
-def update_unknown_to_registered(unknown_visitor_id, new_visitor_id, community_id, resident_id, visitor_name, plate_no):
-    """Update an unknown visitor to registered in a background process and remove the record from the unknown collection. Ensures visitor_id uniqueness."""
-    try:
-        # Check if the new_visitor_id already exists in the registered_faces collection
-        if visitor_data.find_one({"visitor_id": new_visitor_id}):
-            logger.error(f"Visitor ID {new_visitor_id} already exists in the registered_faces collection.")
-            return {"error": f"Visitor ID {new_visitor_id} already exists."}
-
-        # Find the visitor in the unknown_faces collection
-        unknown_visitor = unknown_visitor_data.find_one({"visitor_id": unknown_visitor_id})
-        if not unknown_visitor:
-            logger.error(f"Unknown visitor with ID {unknown_visitor_id} not found.")
-            return {"error": "Unknown visitor not found."}
-
-        # Update the embeddings and prepare the document for registered_faces
-        old_embeddings = unknown_visitor["embeddings"]
-        updated_embeddings = f"{new_visitor_id},{','.join(old_embeddings.split(',')[1:])}"
-
-        registered_visitor = {
-            "community_id": community_id,
-            "resident_id": resident_id,
-            "visitor_id": new_visitor_id,
-            "visitor_name": visitor_name,
-            "plate_no": plate_no,
-            "embeddings": updated_embeddings,
-            "face_image": unknown_visitor["face_image"],  # Keep the face image from the unknown record
-        }
-
-        # Insert the updated visitor into the registered_faces collection
-        result = visitor_data.insert_one(registered_visitor)
-
-        if result.inserted_id:
-            # After a successful insertion, delete the visitor from unknown_faces collection
-            delete_result = unknown_visitor_data.delete_one({"visitor_id": unknown_visitor_id})
-            if delete_result.deleted_count == 1:
-                logger.info(f"Unknown visitor {unknown_visitor_id} successfully updated to registered visitor {new_visitor_id} and removed from unknown_faces collection.")
-            else:
-                logger.error(f"Failed to remove unknown visitor {unknown_visitor_id} from the unknown_faces collection.")
+        # First split to separate ID from embeddings
+        parts = embeddings_str.split(',')
+        if len(parts) < 129:  # ID + 128 embedding values
+            print(f"Invalid embedding format: insufficient values")
+            return None, []
             
-        return {"status": "success", "visitor_id": new_visitor_id}
-
+        visitor_id = parts[0]
+        # Take exactly 128 values for embeddings
+        embeddings = [float(x) for x in parts[1:129]]
+        
+        return visitor_id, embeddings
     except Exception as e:
-        logger.error(f"Failed to update unknown visitor {unknown_visitor_id}: {str(e)}")
-        return {"error": f"Failed to update visitor: {str(e)}"}
+        print(f"Error parsing embeddings: {embeddings_str}. Error: {e}")
+        return None, []
 
-
-
-@app.put("/unknown-visitors/register/")
-async def update_unknown_visitor_to_registered(
-    unknown_visitor_id: str = Form(...),
-    new_visitor_id: str = Form(...),
-    community_id: str = Form(...),
-    resident_id: str = Form(...),
-    visitor_name: str = Form(...),
-    plate_no: Optional[str] = Form(None),
-):
-    """Start the process to update unknown visitor to registered in a background process."""
+def load_embeddings_from_db(community_id):
+    """Load embeddings from MongoDB collection for the specified community ID."""
     try:
-        # Start the update process in a new background process
-        process = multiprocessing.Process(
-            target=update_unknown_to_registered,
-            args=(unknown_visitor_id, new_visitor_id, community_id, resident_id, visitor_name, plate_no)
-        )
-        process.start()
-        process_registry[f"update_{new_visitor_id}"] = process
+        # Query MongoDB for all registered face embeddings (without filtering by community)
+        documents = registered_data.find({}, {"visitor_id": 1, "community_id": 1, "embeddings": 1, "_id": 0})
+        
+        face_ids = []
+        face_embeddings = []
+        
+        for doc in documents:
+            if 'embeddings' not in doc:
+                continue
+            
+            visitor_id, embeddings = parse_embeddings(doc['embeddings'])
+            if visitor_id and len(embeddings) == 128:
+                # Append both visitor_id and community_id in the format "visitor_id:community_id"
+                face_ids.append(f"{visitor_id}:{doc['community_id']}")
+                face_embeddings.append(embeddings)
+        
+        # Convert embeddings to numpy array for easier processing
+        face_embeddings = np.array(face_embeddings, dtype=np.float32)
+        
+        print(f"Loaded {len(face_ids)} known faces from MongoDB.")
+        return face_ids, face_embeddings
+    
+    except PyMongoError as e:
+        print(f"Error loading embeddings from MongoDB: {e}")
+        return [], np.array([])
 
-        return JSONResponse({"message": f"Update process started for unknown visitor {unknown_visitor_id}"})
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to start update process: {str(e)}")
 
 
-# --------------------------- Shutdown Logic ------------------------------
+async def save_unknown_visitor(face_img, embeddings):
+    """
+    Store unknown visitor's image and embeddings in the unknown_faces collection
+    with a strict one-minute save policy for unknown faces.
+    """
+    global last_unknown_save_time  # Use the global variable for tracking save time
+    similarity_threshold = 0.60  # 60% similarity threshold
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Gracefully terminate all running processes on shutdown."""
-    logger.info("Shutting down application...")
+    try:
+        current_time = time.time()
+        embeddings_array = np.array(embeddings)
 
-    # Terminate all running processes
-    for key, process in list(process_registry.items()):
-        if process.is_alive():
-            logger.info(f"Terminating process {key} (PID: {process.pid})")
+        # Skip saving if the last save was under one minute ago
+        if (current_time - last_unknown_save_time) < 60:
+            # Check if the new embedding is similar to any in the embedding history
+            embedding_history = unknown_face_cache.get('embedding_history', {})
+            for _, stored_embeddings in embedding_history.items():
+                if is_similar_face(embeddings_array, stored_embeddings, similarity_threshold=similarity_threshold):
+                    print("Similar face detected within threshold. Skipping save.")
+                    return None, None, None
+
+        _, buffer = cv2.imencode('.jpg', face_img)
+        face_bytes = buffer.tobytes()
+        face_base64 = base64.b64encode(face_bytes).decode('utf-8')
+        new_visitor_id = str(uuid.uuid4())
+
+        # Format embeddings with visitor ID
+        embeddings_with_id = f"{new_visitor_id},{','.join(map(str, embeddings))}"
+
+        unknown_record = {
+            "visitor_id": new_visitor_id,
+            "face_image": face_base64,
+            "embeddings": embeddings_with_id,
+            "timestamp": current_time
+        }
+
+        # Store in the database
+        await asyncio.to_thread(unknown_data.insert_one, unknown_record)
+        print(f"Saved unknown visitor with ID: {new_visitor_id}")
+
+        # Update the last save time for unknown visitors
+        last_unknown_save_time = current_time
+
+        # Add new embedding to the cache for future comparisons
+        unknown_face_cache['embedding_history'][new_visitor_id] = [embeddings_array]
+
+        return new_visitor_id, face_base64, embeddings_with_id
+
+    except PyMongoError as e:
+        print(f"Error saving unknown visitor: {e}")
+        return None, None, None
+
+
+async def get_dlib_embeddings(image_frames):
+    embeddings = []
+
+    for image in image_frames:
+        # Ensure the image is in the correct format (BGR to RGB)
+        if image is None:
+            continue
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        # Detect faces in each image using Dlib detector
+        faces = detector(image_rgb, 2)
+        if len(faces) == 0:
+            print("No faces detected.")
+            continue
+        
+        # If faces are detected, compute embeddings
+        for face in faces:
             try:
-                # Attempt to terminate the process gracefully
-                process.terminate()
-                process.join(timeout=2)  # Give the process some time to terminate
+                shape = predictor(image_rgb, face)
+                face_descriptor = face_reco_model.compute_face_descriptor(image_rgb, shape)
+                embeddings.append(face_descriptor)
             except Exception as e:
-                logger.error(f"Error terminating process {key} (PID: {process.pid}): {str(e)}")
+                print(f"Error computing face descriptor: {e}")
 
-            # If the process is still alive after termination, force kill it
-            if process.is_alive():
-                logger.info(f"Force killing process {key} (PID: {process.pid})")
-                try:
-                    process.kill()  # Force kill if it didn't terminate
-                    process.join()  # Ensure the process is fully terminated
-                except Exception as e:
-                    logger.error(f"Error killing process {key} (PID: {process.pid}): {str(e)}")
+    if embeddings:
+        avg_embedding = np.mean(np.array(embeddings, dtype=np.float32), axis=0)  # Use np.float32 for consistency
+        return avg_embedding.tolist()  # Return as a list
+    else:
+        print("No embeddings were computed.")
+        return None  # Explicitly return None if no embeddings are found
 
-        # Remove the process from the registry once handled
-        process_registry.pop(key, None)
+def recognize_face(face_descriptor, face_ids, face_embeddings, community_id, tolerance=0.40):
+    """
+    Recognize a face by comparing its descriptor with known face embeddings
+    and ensure the person belongs to the same community.
+    
+    Args:
+        face_descriptor: Embedding of the detected face
+        face_ids: List of face IDs loaded from the database (with format "visitor_id:community_id")
+        face_embeddings: Embeddings from MongoDB for comparison
+        community_id: ID of the current community
+        tolerance: Threshold for distance to recognize a face
 
-    logger.info("All processes terminated. Application shutdown complete.")
+    Returns:
+        str: Matched face ID or "Unknown"
+        float: Confidence score
+    """
+    if face_embeddings.size == 0 or face_descriptor is None:
+        return "Unknown", 0.0  # No embeddings to compare
 
-# --------------------------- Main Entry Point ------------------------------
+    # Calculate distances between the new face and known faces
+    distances = np.linalg.norm(face_embeddings - face_descriptor, axis=1)
+    best_match_index = np.argmin(distances)
+    best_distance = distances[best_match_index]
+
+    # Extract the visitor_id and community_id from the matched face
+    matched_face_id = face_ids[best_match_index]
+    matched_visitor_id, matched_community_id = matched_face_id.split(":")  # Split ID and community
+
+    # Check if the matched face belongs to the current community
+    if best_distance <= tolerance and matched_community_id == community_id:
+        # The person belongs to the same community and is recognized
+        return matched_visitor_id, 1.0 - (best_distance / tolerance)  # Confidence score
+    else:
+        # Either the person is not recognized, or they belong to a different community
+        return "Unknown", 0.0  # Treat as unknown
+
+    
+    
+    
+    
+    # -----------------------Payload to webhook ------------------------
+    
+    
+def create_payload(recognized_visitors, unknown_visitors, community_id, camera_id):
+    """Create a JSON payload for recognized and unknown visitors with community and camera IDs."""
+    payload = {
+        "community_id": community_id,
+        "camera_id": camera_id,
+        "recognized_visitors": [],
+        "unknown_visitors": []
+    }
+
+    for visitor in recognized_visitors:
+        # Convert face image to base64
+        face_img = visitor["face_image"]
+        _, buffer = cv2.imencode('.jpg', face_img)
+        face_bytes = buffer.tobytes()
+        face_base64 = base64.b64encode(face_bytes).decode('utf-8')
+
+        # Check if the visitor contains the required fields: resident_id, visitor_name, plate_no
+        # These fields can be optional or can be part of the visitor information stored elsewhere.
+        resident_id = visitor.get("resident_id", "unknown")  # Default to 'unknown' if not provided
+        visitor_name = visitor.get("visitor_name", "unknown")  # Default to 'unknown' if not provided
+        plate_no = visitor.get("plate_no", "N/A")  # Default to 'N/A' if not provided
+
+        # Add recognized visitor details to the payload
+        payload["recognized_visitors"].append({
+            "id": visitor["name"],  # The recognized visitor's ID or name
+            "face_image": face_base64,  # Base64 encoded face image
+            "community_id": community_id,  # Community ID
+            "camera_id": camera_id,  # Camera ID
+            "resident_id": resident_id,  # Resident ID (if available)
+            "visitor_name": visitor_name,  # Visitor name (if available)
+            "plate_no": plate_no  # Plate number (if available)
+        })
+
+    for unknown in unknown_visitors:
+        payload["unknown_visitors"].append({
+            "visitor_id": unknown["visitor_id"],
+            "face_image": unknown["face_image"],
+            "community_id": community_id,
+            "camera_id": camera_id
+        })
+
+    return json.dumps(payload)
+
+
+
+# Add these global variables at the top of your script
+webhook_cache = {
+    'last_webhooks': {},  # Store last webhook time for each face (recognized or unknown)
+    'last_embeddings': {}  # Store last embeddings for each face
+}
+
+def should_send_webhook(face_id, new_embedding, similarity_threshold=0.60, time_threshold_minutes=1):
+    """
+    Determine if a webhook should be sent based on embedding similarity and time threshold.
+    
+    Args:
+        face_id: Identifier for the face (visitor_id for unknown, name for recognized)
+        new_embedding: New face embedding
+        similarity_threshold: Minimum similarity threshold (default: 0.60 or 60%)
+        time_threshold_minutes: Minimum time between webhooks for similar faces (default: 1 minute)
+    
+    Returns:
+        bool: Whether to send the webhook
+    """
+    current_time = datetime.now()
+    
+    # Get last webhook time and embedding for this face
+    last_webhook_time = webhook_cache['last_webhooks'].get(face_id)
+    last_embedding = webhook_cache['last_embeddings'].get(face_id)
+    
+    # If no previous webhook for this face, always send
+    if last_webhook_time is None or last_embedding is None:
+        webhook_cache['last_webhooks'][face_id] = current_time
+        webhook_cache['last_embeddings'][face_id] = new_embedding
+        return True
+    
+    # Check time threshold
+    time_diff = current_time - last_webhook_time
+    if time_diff < timedelta(minutes=time_threshold_minutes):
+        # Within time threshold, check similarity
+        similarity = calculate_embedding_similarity(new_embedding, last_embedding)
+        
+        if similarity >= similarity_threshold:
+            # Too similar and too recent, don't send webhook
+            return False
+    
+    # Update cache with new data
+    webhook_cache['last_webhooks'][face_id] = current_time
+    webhook_cache['last_embeddings'][face_id] = new_embedding
+    return True
+
+async def recognize_person(frame, face_ids, face_embeddings, community_id, camera_id):
+    """Modified recognize_person function with similarity-based webhook sending and community ID check."""
+    results = yolo_detector(frame)
+    recognized_visitors = []
+    recognized_ids = []
+    unknown_visitors_data = []
+
+    for result in results:
+        for bbox in result.boxes.xyxy:
+            x1, y1, x2, y2 = map(int, bbox)
+            face_img = frame[y1:y2, x1:x2]
+            face_embedding = await get_dlib_embeddings([face_img])
+
+            if face_embedding is None:
+                print("No valid face embedding found, skipping this frame.")
+                continue
+
+            # Use the modified recognize_face function to ensure the person belongs to the correct community
+            matched_id, confidence_score = recognize_face(
+                face_descriptor=face_embedding,
+                face_ids=face_ids,
+                face_embeddings=face_embeddings,
+                community_id=community_id  # Pass the current community ID
+            )
+
+            # Draw bounding box and label
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            label = f"Recognized: {matched_id}"
+            cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+
+            # Check if we should send a webhook based on similarity
+            should_send = should_send_webhook(
+                face_id=matched_id,
+                new_embedding=face_embedding
+            )
+
+            if not should_send:
+                print(f"Skipping webhook for {matched_id} due to similarity threshold")
+                continue
+
+            if matched_id == "Unknown":
+                # Save unknown visitor
+                new_visitor_id, face_base64, embeddings_with_id = await save_unknown_visitor(
+                    face_img,
+                    face_embedding
+                )
+                if new_visitor_id:
+                    unknown_visitors_data.append({
+                        "visitor_id": new_visitor_id,
+                        "face_image": face_base64,
+                        "embeddings": embeddings_with_id
+                    })
+            else:
+                recognized_ids.append(matched_id)
+                embeddings_with_id = f"{matched_id},{','.join(map(str, face_embedding))}"
+
+            recognized_visitors.append({
+                "name": matched_id,
+                "face_image": face_img,
+                "embeddings": embeddings_with_id,
+                "bbox": (x1, y1, x2, y2)
+            })
+
+    # Only create and send payload if we have new visitors to report
+    if recognized_visitors or unknown_visitors_data:
+        payload = create_payload(recognized_visitors, unknown_visitors_data, community_id, camera_id)
+        print("Sending payload for new or significantly different faces...")
+
+        try:
+            response = requests.post(
+                "https://mysentri.com/api/v2/facial-recognition-alerts-webhook",
+                data=payload,
+                headers={"Content-Type": "application/json"}
+            )
+            if response.status_code == 200:
+                print("Payload sent successfully!")
+            else:
+                print(f"Failed to send payload: {response.status_code} - {response.text}")
+        except Exception as e:
+            print(f"Error sending webhook: {e}")
+
+    return frame, recognized_visitors, recognized_ids, unknown_visitors_data
+
+
+
+# ----------------main function------------------------
+
+async def FaceRecognitionRtsp(rtsp_url, community_id, camera_id):
+    """Main function to perform real-time face recognition on an RTSP stream."""
+    face_ids, face_embeddings = load_embeddings_from_db(community_id)
+
+    cap = cv2.VideoCapture(rtsp_url)
+    all_recognized_ids = []
+    all_unknown_visitors_data = []
+
+    try:
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                print(f"Failed to grab frame from {rtsp_url}")
+                break
+
+            frame, recognized_visitors, recognized_ids, unknown_visitors_data = await recognize_person(
+                frame, face_ids, face_embeddings, community_id, camera_id
+            )
+
+            if recognized_ids:
+                all_recognized_ids.extend(recognized_ids)
+            all_unknown_visitors_data.extend(unknown_visitors_data)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                print("User requested exit")
+                break
+
+    except Exception as e:
+        print(f"Error in face recognition loop for {rtsp_url}: {e}")
+    finally:
+        cap.release()
+
+    return frame, all_recognized_ids, recognized_visitors, all_unknown_visitors_data
+
+
+async def main(rtsp_urls, community_id, camera_id):
+    """Run face recognition concurrently on multiple RTSP URLs."""
+    with ThreadPoolExecutor(max_workers=len(rtsp_urls)) as executor:
+        loop = asyncio.get_running_loop()
+        tasks = [
+            loop.run_in_executor(
+                executor,
+                lambda url=rtsp_url: asyncio.run(FaceRecognitionRtsp(url, community_id, camera_id))
+            ) for rtsp_url in rtsp_urls
+        ]
+        results = await asyncio.gather(*tasks)
+        for i, (recognized_ids, unknown_visitors) in enumerate(results):
+            print(f"Stream {rtsp_urls[i]}: Final recognized IDs: {recognized_ids}")
+            print(f"Stream {rtsp_urls[i]}: Total unknown visitors detected: {len(unknown_visitors)}")
 
 if __name__ == "__main__":
-    # Use `uvicorn` to run the FastAPI app
-    uvicorn.run("mainv4:app", host="0.0.0.0", port=8000)
+    try:
+        rtsp_urls = [
+            "rtsp://192.168.1.2:554/stream1",
+            "rtsp://192.168.1.3:554/stream2",
+            # Add more RTSP URLs as needed
+        ]
+        community_id = "your_community_id"
+        camera_id = "your_camera_id"
+        print("Starting face recognition system on multiple streams...")
+        asyncio.run(main(rtsp_urls, community_id, camera_id))
+    except KeyboardInterrupt:
+        print("\nProgram terminated by user")
+    except Exception as e:
+        print(f"Program error: {e}")
+    finally:
+        # cv2.destroyAllWindows()
+        client.close()
+
