@@ -17,6 +17,9 @@ import requests
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 
+
+
+
 import numpy as np
 
 # MongoDB configuration
@@ -85,68 +88,36 @@ def parse_embeddings(embeddings_str: str) -> tuple:
         print(f"Error parsing embeddings: {embeddings_str}. Error: {e}")
         return None, []
 
-def fetch_and_write_embeddings_to_csv(csv_file_path: str):
-    """Fetch embeddings from MongoDB and append only new embeddings to CSV."""
+def load_embeddings_from_db(community_id):
+    """Load embeddings from MongoDB collection for the specified community ID."""
     try:
-        # Check if file exists and get existing IDs
-        existing_embeddings = set()
-        if os.path.exists(csv_file_path):
-            with open(csv_file_path, mode='r', newline='') as file:
-                reader = csv.reader(file)
-                existing_embeddings = {row[0] for row in reader if row}
-
-        # Get new embeddings from MongoDB
-        new_embeddings = []
-        documents = registered_data.find({}, {"visitor_id": 1, "embeddings": 1, "_id": 0})
+        # Query MongoDB for all registered face embeddings (without filtering by community)
+        documents = registered_data.find({}, {"visitor_id": 1, "community_id": 1, "embeddings": 1, "_id": 0})
+        
+        face_ids = []
+        face_embeddings = []
         
         for doc in documents:
-            if 'embeddings' not in doc or doc['visitor_id'] in existing_embeddings:
+            if 'embeddings' not in doc:
                 continue
-                
+            
             visitor_id, embeddings = parse_embeddings(doc['embeddings'])
             if visitor_id and len(embeddings) == 128:
-                new_embeddings.append([visitor_id] + embeddings)
-
-        # Write new embeddings to CSV
-        if new_embeddings:
-            # If file doesn't exist, create it with header
-            if not os.path.exists(csv_file_path):
-                with open(csv_file_path, mode='w', newline='') as file:
-                    writer = csv.writer(file)
-                    header = ['id'] + [f'embedding_{i}' for i in range(128)]
-                    writer.writerow(header)
-            
-            # Append new embeddings
-            with open(csv_file_path, mode='a', newline='') as file:
-                writer = csv.writer(file)
-                writer.writerows(new_embeddings)
-            print(f"Appended {len(new_embeddings)} new embeddings to CSV.")
-        else:
-            print("No new embeddings to append.")
-            
-    except Exception as e:
-        print(f"Error writing to CSV: {e}")
-
-def load_embeddings_from_csv():
-    """Load embeddings from CSV and return face IDs and embeddings."""
-    try:
-        if not os.path.exists(csv_file):
-            print("CSV file not found.")
-            return [], np.array([])
-            
-        # Read CSV with explicit column count
-        known_face_data = pd.read_csv(csv_file, header=0)  # Assume first row is header
+                # Append both visitor_id and community_id in the format "visitor_id:community_id"
+                face_ids.append(f"{visitor_id}:{doc['community_id']}")
+                face_embeddings.append(embeddings)
         
-        if len(known_face_data.columns) != 129:  # ID + 128 embedding values
-            print(f"Invalid CSV format: expected 129 columns, got {len(known_face_data.columns)}")
-            return [], np.array([])
-            
-        print(f"Loaded {len(known_face_data)} known faces from CSV.")
-        return known_face_data.iloc[:, 0].values.tolist(), known_face_data.iloc[:, 1:].values.astype(np.float32)
+        # Convert embeddings to numpy array for easier processing
+        face_embeddings = np.array(face_embeddings, dtype=np.float32)
         
-    except Exception as e:
-        print(f"Error loading CSV: {e}")
+        print(f"Loaded {len(face_ids)} known faces from MongoDB.")
+        return face_ids, face_embeddings
+    
+    except PyMongoError as e:
+        print(f"Error loading embeddings from MongoDB: {e}")
         return [], np.array([])
+
+
 
 async def save_unknown_visitor(face_img, embeddings):
     """
@@ -232,19 +203,42 @@ async def get_dlib_embeddings(image_frames):
         print("No embeddings were computed.")
         return None  # Explicitly return None if no embeddings are found
 
-def recognize_face(face_descriptor, face_ids, face_embeddings, tolerance=0.40):
-    """Recognize a face by comparing its descriptor with known face embeddings."""
-    if face_embeddings.size == 0 or face_descriptor is None:
-        return "Unknown", 0.0  # Handle the case where embeddings are empty or invalid
+def recognize_face(face_descriptor, face_ids, face_embeddings, community_id, tolerance=0.40):
+    """
+    Recognize a face by comparing its descriptor with known face embeddings
+    and ensure the person belongs to the same community.
+    
+    Args:
+        face_descriptor: Embedding of the detected face
+        face_ids: List of face IDs loaded from the database (with format "visitor_id:community_id")
+        face_embeddings: Embeddings from MongoDB for comparison
+        community_id: ID of the current community
+        tolerance: Threshold for distance to recognize a face
 
+    Returns:
+        str: Matched face ID or "Unknown"
+        float: Confidence score
+    """
+    if face_embeddings.size == 0 or face_descriptor is None:
+        return "Unknown", 0.0  # No embeddings to compare
+
+    # Calculate distances between the new face and known faces
     distances = np.linalg.norm(face_embeddings - face_descriptor, axis=1)
     best_match_index = np.argmin(distances)
     best_distance = distances[best_match_index]
 
-    if best_distance <= tolerance:
-        return face_ids[best_match_index], 1.0 - (best_distance / tolerance)  # Confidence score based on distance
+    # Extract the visitor_id and community_id from the matched face
+    matched_face_id = face_ids[best_match_index]
+    matched_visitor_id, matched_community_id = matched_face_id.split(":")  # Split ID and community
+
+    # Check if the matched face belongs to the current community
+    if best_distance <= tolerance and matched_community_id == community_id:
+        # The person belongs to the same community and is recognized
+        return matched_visitor_id, 1.0 - (best_distance / tolerance)  # Confidence score
     else:
-        return "Unknown", 0.0  # No match found
+        # Either the person is not recognized, or they belong to a different community
+        return "Unknown", 0.0  # Treat as unknown
+
     
     
     
@@ -267,12 +261,22 @@ def create_payload(recognized_visitors, unknown_visitors, community_id, camera_i
         _, buffer = cv2.imencode('.jpg', face_img)
         face_bytes = buffer.tobytes()
         face_base64 = base64.b64encode(face_bytes).decode('utf-8')
-        
+
+        # Check if the visitor contains the required fields: resident_id, visitor_name, plate_no
+        # These fields can be optional or can be part of the visitor information stored elsewhere.
+        resident_id = visitor.get("resident_id", "unknown")  # Default to 'unknown' if not provided
+        visitor_name = visitor.get("visitor_name", "unknown")  # Default to 'unknown' if not provided
+        plate_no = visitor.get("plate_no", "N/A")  # Default to 'N/A' if not provided
+
+        # Add recognized visitor details to the payload
         payload["recognized_visitors"].append({
-            "id": visitor["name"],
-            "face_image": face_base64,
-            "community_id": community_id,
-            "camera_id": camera_id
+            "id": visitor["name"],  # The recognized visitor's ID or name
+            "face_image": face_base64,  # Base64 encoded face image
+            "community_id": community_id,  # Community ID
+            "camera_id": camera_id,  # Camera ID
+            "resident_id": resident_id,  # Resident ID (if available)
+            "visitor_name": visitor_name,  # Visitor name (if available)
+            "plate_no": plate_no  # Plate number (if available)
         })
 
     for unknown in unknown_visitors:
@@ -334,7 +338,7 @@ def should_send_webhook(face_id, new_embedding, similarity_threshold=0.60, time_
     return True
 
 async def recognize_person(frame, face_ids, face_embeddings, community_id, camera_id):
-    """Modified recognize_person function with similarity-based webhook sending."""
+    """Modified recognize_person function with similarity-based webhook sending and community ID check."""
     results = yolo_detector(frame)
     recognized_visitors = []
     recognized_ids = []
@@ -350,10 +354,12 @@ async def recognize_person(frame, face_ids, face_embeddings, community_id, camer
                 print("No valid face embedding found, skipping this frame.")
                 continue
 
+            # Use the modified recognize_face function to ensure the person belongs to the correct community
             matched_id, confidence_score = recognize_face(
                 face_descriptor=face_embedding,
                 face_ids=face_ids,
-                face_embeddings=face_embeddings
+                face_embeddings=face_embeddings,
+                community_id=community_id  # Pass the current community ID
             )
 
             # Draw bounding box and label
@@ -361,7 +367,7 @@ async def recognize_person(frame, face_ids, face_embeddings, community_id, camer
             label = f"Recognized: {matched_id}"
             cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
 
-            # Check if we should send webhook based on similarity
+            # Check if we should send a webhook based on similarity
             should_send = should_send_webhook(
                 face_id=matched_id,
                 new_embedding=face_embedding
@@ -415,12 +421,12 @@ async def recognize_person(frame, face_ids, face_embeddings, community_id, camer
     return frame, recognized_visitors, recognized_ids, unknown_visitors_data
 
 
+
 # ----------------main function------------------------
 
 async def FaceRecognitionRtsp(rtsp_url, community_id, camera_id):
     """Main function to perform real-time face recognition on an RTSP stream."""
-    fetch_and_write_embeddings_to_csv(csv_file)
-    face_ids, face_embeddings = load_embeddings_from_csv()
+    face_ids, face_embeddings = load_embeddings_from_db(community_id)
 
     cap = cv2.VideoCapture(rtsp_url)
     all_recognized_ids = []
@@ -441,13 +447,17 @@ async def FaceRecognitionRtsp(rtsp_url, community_id, camera_id):
                 all_recognized_ids.extend(recognized_ids)
             all_unknown_visitors_data.extend(unknown_visitors_data)
 
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                print("User requested exit")
+                break
+
     except Exception as e:
         print(f"Error in face recognition loop for {rtsp_url}: {e}")
     finally:
         cap.release()
-        # cv2.destroyAllWindows()
 
-    return frame, all_recognized_ids,recognized_visitors, all_unknown_visitors_data
+    return frame, all_recognized_ids, recognized_visitors, all_unknown_visitors_data
+
 
 async def main(rtsp_urls, community_id, camera_id):
     """Run face recognition concurrently on multiple RTSP URLs."""
